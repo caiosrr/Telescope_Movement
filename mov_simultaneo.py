@@ -1,4 +1,6 @@
 import itertools
+import ctypes
+import sys
 import time
 import requests
 import numpy as np
@@ -18,6 +20,9 @@ VEL_MIN_LIMITE = 0.001042
 VEL_MAX_LIMITE = 6.0
 MAX_TEMPO_MOV = 450
 MAX_CORRECOES = 10
+_status_line_len = 0
+_status_slot_active = False
+_ansi_cursor_ok = False
 
 
 class PID:
@@ -125,7 +130,7 @@ def read_altaz():
 
 def move_axis(axis: int, rate_deg_per_s: float, mount: bool):
     if mount and axis == 0:
-        rate_deg_per_s = -rate_deg_per_s
+        rate_deg_per_s = -rate_deg_per_s # Inverte o sinal para o azimute no mount.
     call("PUT", "moveaxis", data={"Axis": axis, "Rate": float(rate_deg_per_s)})
 
 
@@ -137,6 +142,60 @@ def calc_error(axis:int, alvo: float, pos: float) -> float:
         return diff
     else:
         return alvo - pos
+
+
+def _enable_virtual_terminal() -> bool:
+    if sys.platform != "win32":
+        return True
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        if handle == 0 or handle == -1:
+            return False
+
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+
+        enable_vt = 0x0004
+        if (mode.value & enable_vt) == 0:
+            if kernel32.SetConsoleMode(handle, mode.value | enable_vt) == 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+_ansi_cursor_ok = _enable_virtual_terminal()
+
+
+def _status_write(message: str):
+    global _status_line_len, _status_slot_active
+    padded = message.ljust(max(_status_line_len, len(message)))
+
+    if _ansi_cursor_ok:
+        if not _status_slot_active:
+            sys.stdout.write("\n")
+            _status_slot_active = True
+        sys.stdout.write("\x1b[1A\x1b[2K" + padded + "\n")
+    else:
+        sys.stdout.write("\r" + padded)
+
+    sys.stdout.flush()
+    _status_line_len = len(message)
+
+
+def _status_clear():
+    global _status_line_len, _status_slot_active
+    if _status_line_len:
+        if _ansi_cursor_ok and _status_slot_active:
+            sys.stdout.write("\x1b[1A\x1b[2K")
+        else:
+            sys.stdout.write("\r" + (" " * _status_line_len) + "\r")
+        sys.stdout.flush()
+        _status_line_len = 0
+    _status_slot_active = False
 
 
 def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
@@ -155,8 +214,8 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
         alvo_alt = -90.0
 
     # Instancia dois PIDs independentes
-    pid_az = PID(kp=0.75, ki=0.0001, kd=0.04, setpoint=alvo_az, output_limits=(-VEL_MAX_LIMITE, VEL_MAX_LIMITE), integral_limit=5)
-    pid_alt = PID(kp=0.75, ki=0.0001, kd=0.04, setpoint=alvo_alt, output_limits=(-VEL_MAX_LIMITE, VEL_MAX_LIMITE), integral_limit=5)
+    pid_az = PID(kp=1.3967, ki=0.0001, kd=0.1015, setpoint=alvo_az, output_limits=(-VEL_MAX_LIMITE, VEL_MAX_LIMITE), integral_limit=5)
+    pid_alt = PID(kp=1.3967, ki=0.0001, kd=0.1015, setpoint=alvo_alt, output_limits=(-VEL_MAX_LIMITE, VEL_MAX_LIMITE), integral_limit=5)
 
     print("\nMovimento PID 2D Iniciado:")
     print(f"  Alvo Azimute  = {alvo_az:.4f}° (Δ {delta_az:+.4f}°)")
@@ -187,6 +246,7 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
                 err_abs_alt = abs(error_alt)
 
                 if tempo_decorrido > MAX_TEMPO_MOV:
+                    _status_clear()
                     print("\n⚠️ Tempo limite atingido.")
                     break
 
@@ -195,6 +255,7 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
                 alt_ok = err_abs_alt < TOLERANCIA_GRAUS
 
                 if az_ok and alt_ok:
+                    _status_clear()
                     print("\n✅ Ambos os eixos dentro da tolerância.")
                     executor.submit(move_axis, 0, 0.0, mount)
                     executor.submit(move_axis, 1, 0.0, mount)
@@ -204,6 +265,7 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
                 if error_last_az is not None and error_az * error_last_az < 0:
                     inversoes_az += 1
                     if inversoes_az > MAX_CORRECOES:
+                        _status_clear()
                         print("\n⚠️ Excesso de inversões em Azimute. Abortando eixo 0.")
                         cmd_az = 0.0
                     else:
@@ -214,6 +276,7 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
                 if error_last_alt is not None and error_alt * error_last_alt < 0:
                     inversoes_alt += 1
                     if inversoes_alt > MAX_CORRECOES:
+                        _status_clear()
                         print("\n⚠️ Excesso de inversões em Altitude. Abortando eixo 1.")
                         cmd_alt = 0.0
                     else:
@@ -251,7 +314,9 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
                     future_alt.result()
 
                 # Interface visual compacta
-                print(f"Az: Err={error_az:+.4f}° Cmd={cmd_az:+.4f} | Alt: Err={error_alt:+.4f}° Cmd={cmd_alt:+.4f}   ", end="\r")
+                _status_write(
+                    f"Az E:{error_az:+.4f} V:{cmd_az:+.4f} | Alt E:{error_alt:+.4f} V:{cmd_alt:+.4f}"
+                )
 
                 error_last_az = error_az
                 error_last_alt = error_alt
@@ -271,7 +336,8 @@ def move_axes_pid_2d(mount: bool, delta_az: float, delta_alt: float):
             # Parada dura sequencial para emergências e fim de execução
             call("PUT", "moveaxis", data={"Axis": 0, "Rate": 0.0}, timeout=2.0)
             call("PUT", "moveaxis", data={"Axis": 1, "Rate": 0.0}, timeout=2.0)
-            
+
+            _status_clear()
             azf, altf = read_altaz()
             print(f"\nPos final: Az={azf:.4f}°, Alt={altf:.4f}° | Tempo total: {tempo_decorrido:.2f}s")
 

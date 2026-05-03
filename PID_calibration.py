@@ -1,0 +1,246 @@
+import time
+import requests
+import itertools
+import random
+import numpy as np
+
+# ==== Configurações Alpaca ====
+BASE_URL = "http://127.0.0.1:11111/api/v1/telescope/0"
+CLIENT_ID = 1
+_transaction_ids = itertools.count(1)
+session = requests.Session()
+
+VEL_MAX_LIMITE = 6.0
+TOLERANCIA_GRAUS = 0.0005
+
+# =====================================================================
+# 1. FUNÇÕES DE COMUNICAÇÃO COM O HARDWARE
+# =====================================================================
+def call(method: str, command: str, timeout: float = 5.0, **extra_args):
+    params = {"ClientID": CLIENT_ID, "ClientTransactionID": next(_transaction_ids)}
+    params.update(extra_args.pop("params", {}))
+    resp = session.request(method, f"{BASE_URL}/{command}", params=params, timeout=timeout, **extra_args)
+    resp.raise_for_status()
+    return resp.json().get("Value")
+
+def read_altaz():
+    az = float(call("GET", "azimuth"))
+    alt = float(call("GET", "altitude"))
+    return az, alt
+
+def move_axis(axis: int, rate: float):
+    call("PUT", "moveaxis", data={"Axis": axis, "Rate": float(rate)})
+
+def garantir_parada(axis: int):
+    move_axis(axis, 0.0)
+    time.sleep(0.5)
+
+# =====================================================================
+# 2. IDENTIFICAÇÃO DO SISTEMA FÍSICO (Coleta de Dados)
+# =====================================================================
+def medir_inercia_telescopio(eixo: int) -> float:
+    print(f"\n[FASE 1] Levantando modelo físico do Eixo {eixo}...")
+    print("Enviando pulso de velocidade para medir aceleração/desaceleração.")
+    
+    garantir_parada(eixo)
+    az0, alt0 = read_altaz()
+    pos0 = alt0 if eixo == 1 else az0
+    
+    posicoes = []
+    tempos = []
+    
+    t_inicio = time.time()
+    
+    # Inicia movimento a 1.0 deg/s
+    move_axis(eixo, 1.0)
+    
+    # Grava dados acelerando e em velocidade de cruzeiro por 1.5s
+    while time.time() - t_inicio < 1.5:
+        az, alt = read_altaz()
+        pos = alt if eixo == 1 else az
+        posicoes.append(pos)
+        tempos.append(time.time() - t_inicio)
+        time.sleep(0.02)
+        
+    # Manda parar!
+    az_stop, alt_stop = read_altaz()
+    pos_no_corte = alt_stop if eixo == 1 else az_stop
+    t_frenagem = time.time()
+    move_axis(eixo, 0.0)
+    
+    # Grava dados freando até parar totalmente (mais 1.5s)
+    while time.time() - t_frenagem < 1.5:
+        az, alt = read_altaz()
+        pos = alt if eixo == 1 else az
+        posicoes.append(pos)
+        tempos.append(time.time() - t_inicio)
+        time.sleep(0.02)
+
+    garantir_parada(eixo)
+    
+    # Retorna o telescópio para o ponto de partida
+    print("Medição concluída. Retornando ao ponto zero físico...")
+    move_axis(eixo, -1.0)
+    time.sleep(1.5)
+    garantir_parada(eixo)
+    
+    # Calcula a inércia (Tau). 
+    # Simplificação robusta: O tempo que a posição continuou mudando significativamente após o comando de parada.
+    pos_final = posicoes[-1]
+    deslizamento = abs(pos_final - pos_no_corte)
+    
+    # Tau é o fator de tempo de reação. Quanto maior o deslizamento, maior a inércia mecânica.
+    tau = max(0.05, deslizamento / 1.0) # Se escorregou 0.1 deg a 1deg/s, tau = 0.1s
+    
+    print(f"-> Escorregamento medido: {deslizamento:.4f}°")
+    print(f"-> Constante de Inércia Estimada (Tau): {tau:.4f} segundos")
+    
+    return tau
+
+# =====================================================================
+# 3. O GÊMEO DIGITAL (Simulador Matemático)
+# =====================================================================
+def simular_pid(kp, ki, kd, tau, setpoint_deg=1.0):
+    """
+    Roda a malha de controle 100% na memória do PC, usando a inércia medida.
+    Retorna o Custo (Fitness) dessa configuração.
+    """
+    dt = 0.05 # Passo de simulação de 50ms
+    
+    pos_virtual = 0.0
+    vel_virtual = 0.0
+    
+    integral = 0.0
+    last_error = setpoint_deg
+    
+    tempo_simulado = 0.0
+    max_tempo_sim = 10.0 # Se não chegar em 10s virtuais, falhou.
+    
+    inversoes = 0
+    tempo_assentamento = max_tempo_sim
+    erro_integral_abs = 0.0
+    
+    while tempo_simulado < max_tempo_sim:
+        error = setpoint_deg - pos_virtual
+        erro_abs = abs(error)
+        erro_integral_abs += erro_abs * dt
+        
+        # Lógica PID Clássica
+        de = (error - last_error) / dt
+        integral += error * dt
+        integral = np.clip(integral, -5, 5) # Anti-windup
+        
+        cmd_rate = (kp * error) + (ki * integral) + (kd * de)
+        cmd_rate = np.clip(cmd_rate, -VEL_MAX_LIMITE, VEL_MAX_LIMITE)
+        
+        # A MÁGICA DA FÍSICA: Filtro Passa-Baixa de Velocidade simulando Inércia
+        # A velocidade real não muda instantaneamente para o cmd_rate, ela tem um atraso baseado no Tau.
+        vel_virtual += (cmd_rate - vel_virtual) * (dt / tau)
+        
+        # Atualiza posição virtual
+        pos_virtual += vel_virtual * dt
+        
+        # Checa sucesso e overshoots
+        if error * last_error < 0:
+            inversoes += 1
+            integral = 0.0 # Reseta integral no overshoot
+            
+        if erro_abs < TOLERANCIA_GRAUS and abs(vel_virtual) < 0.01:
+            tempo_assentamento = tempo_simulado
+            break
+            
+        last_error = error
+        tempo_simulado += dt
+
+    # Penalidades do PSO
+    peso_tempo = 10.0
+    peso_overshoot = 50.0
+    peso_erro_estatico = 100.0
+    
+    erro_final = abs(setpoint_deg - pos_virtual)
+    custo = (peso_tempo * tempo_assentamento) + (peso_overshoot * inversoes) + (peso_erro_estatico * erro_final)
+    
+    return custo
+
+# =====================================================================
+# 4. ALGORITMO GENÉTICO: PARTICLE SWARM OPTIMIZATION (PSO)
+# =====================================================================
+def otimizar_pso_virtual(tau_medido: float):
+    print("\n[FASE 2] Iniciando Otimização no Gêmeo Digital...")
+    # Limites de busca [Kp, Ki, Kd]. Aqui podemos ser bem soltos, pois é tudo virtual!
+    limites = [(0.1, 2.0), (0.0, 0.01), (0.0, 0.1)]
+    
+    num_particulas = 30 # População grande
+    num_geracoes = 20   # Evolução profunda
+    
+    w = 0.5  # Inércia da partícula
+    c1 = 1.5 # Aprendizado individual
+    c2 = 1.5 # Aprendizado social
+    
+    # Inicializa enxame aleatório
+    posicoes = np.random.uniform(
+        low=[b[0] for b in limites], 
+        high=[b[1] for b in limites], 
+        size=(num_particulas, 3)
+    )
+    velocidades = np.random.uniform(-0.01, 0.01, size=(num_particulas, 3))
+    
+    melhores_pos_individuais = np.copy(posicoes)
+    melhores_custos_individuais = np.full(num_particulas, np.inf)
+    
+    melhor_pos_global = None
+    melhor_custo_global = np.inf
+    
+    for geracao in range(num_geracoes):
+        for i in range(num_particulas):
+            kp, ki, kd = posicoes[i]
+            
+            # Testa a partícula na SIMULAÇÃO
+            custo = simular_pid(kp, ki, kd, tau_medido)
+            
+            if custo < melhores_custos_individuais[i]:
+                melhores_custos_individuais[i] = custo
+                melhores_pos_individuais[i] = posicoes[i]
+                
+            if custo < melhor_custo_global:
+                melhor_custo_global = custo
+                melhor_pos_global = posicoes[i]
+                
+        # Move o enxame
+        r1, r2 = np.random.rand(2)
+        velocidades = (w * velocidades + 
+                       c1 * r1 * (melhores_pos_individuais - posicoes) + 
+                       c2 * r2 * (melhor_pos_global - posicoes))
+        posicoes += velocidades
+        
+        # Respeita limites
+        for j in range(3):
+            posicoes[:, j] = np.clip(posicoes[:, j], limites[j][0], limites[j][1])
+            
+        print(f"Geração {geracao+1:02d}/{num_geracoes} | Melhor Custo Virtual: {melhor_custo_global:.2f} | Melhor Kp: {melhor_pos_global[0]:.3f}")
+
+    print("\n" + "="*50)
+    print("🎯 OTIMIZAÇÃO VIRTUAL CONCLUÍDA")
+    print("="*50)
+    print(f"Ganho Proporcional (Kp): {melhor_pos_global[0]:.4f}")
+    print(f"Ganho Integral (Ki):     {melhor_pos_global[1]:.6f}")
+    print(f"Ganho Derivativo (Kd):   {melhor_pos_global[2]:.4f}")
+    print("Substitua essas constantes no seu controlador principal!")
+
+if __name__ == "__main__":
+    if call("GET", "connected"):
+        try:
+            eixo_alvo = int(input("Qual eixo deseja levantar o modelo físico? (0=Az, 1=Alt): "))
+            
+            # Fase 1: Encosta no telescópio real 1 vez
+            tau_real = medir_inercia_telescopio(eixo_alvo)
+            
+            # Fase 2: Roda 600 testes (30 partículas x 20 gerações) na memória em 2 segundos
+            otimizar_pso_virtual(tau_real)
+            
+        except KeyboardInterrupt:
+            garantir_parada(0)
+            garantir_parada(1)
+            print("\nCancelado.")
+    else:
+        print("Telescópio não conectado!")

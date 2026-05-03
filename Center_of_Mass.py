@@ -4,6 +4,7 @@ import requests
 import numpy as np
 import cv2
 
+from artifact_paths import display_path, matrix_candidates
 # Mantém as importações originais de conexão
 from PID_controll import (
     ensure_connected,
@@ -18,6 +19,8 @@ from mov_simultaneo import move_axes_pid_2d
 BASE_URL = "http://127.0.0.1:11111/api/v1/camera/0"
 CLIENT_ID = 1
 _transaction_ids = itertools.count(1)
+session = requests.Session()
+IMAGE_READY_POLL_S = 0.005
 
 lim_px = 2.0  # tolerância padrão em pixels
 
@@ -27,7 +30,7 @@ def call(method: str, command: str, timeout: float = 5.0, **extra_args):
         "ClientTransactionID": next(_transaction_ids),
     }
     params.update(extra_args.pop("params", {}))
-    resp = requests.request(
+    resp = session.request(
         method,
         f"{BASE_URL}/{command}",
         params=params,
@@ -57,7 +60,7 @@ def start_exposure(duration_seconds: float, light: bool = True) -> None:
     print(f"Iniciando exposição: {duration_seconds:.6f}s | luz={light}")
     call("PUT", "startexposure", data={"Duration": duration_seconds, "Light": light})
 
-def wait_until_image_ready(poll_interval: float = 0.05, timeout: float = 5.0) -> None:
+def wait_until_image_ready(poll_interval: float = IMAGE_READY_POLL_S, timeout: float = 5.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         ready = bool(call("GET", "imageready"))
@@ -185,12 +188,22 @@ def main() -> None:
         cv2.imwrite(output_path_inicial, frame_inicial)
         print(f"Frame inicial salvo em: {output_path_inicial}")
 
+        candidates = matrix_candidates("A_inv_coarse.npy", "calibracao_A_inv.npy")
         try:
-            A_inv = np.load("calibracao_A_inv.npy")
-            if A_inv.shape != (2, 2):
-                raise ValueError("Matriz A_inv com shape inválido.")
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+                A_inv = np.load(candidate)
+                if A_inv.shape != (2, 2):
+                    raise ValueError("Matriz A_inv com shape inválido.")
+                print(f"Matriz carregada: {display_path(candidate)}")
+                break
+            else:
+                raise FileNotFoundError(
+                    f"Testei: {', '.join(str(path) for path in candidates)}"
+                )
         except Exception as e:
-            print(f"\nNão foi possível carregar 'calibracao_A_inv.npy': {e}")
+            print(f"\nNão foi possível carregar a matriz de centralização: {e}")
             print("Execute primeiro a calibração 2D para gerar este arquivo.")
             return
 

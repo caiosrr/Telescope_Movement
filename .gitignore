@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Imagens, videos e auditorias geradas em bancada.
+*.png
+*.jpg
+*.jpeg
+*.mp4
+temporarios/auditoria_foco_temp*/
+
+# Saidas numericas grandes/temporarias. As matrizes pequenas em resultados/matrizes
+# ficam versionadas porque o tracker pode precisar delas para rodar.
+resultados/json/*.json
+
+# Arquivos locais de editor/sistema.
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

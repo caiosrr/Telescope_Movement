@@ -24,6 +24,7 @@ from controle.alvo_alinhamento import (
 )
 from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked
 from controle.mount_control import VEL_MAX_LIMITE, VEL_MIN_LIMITE, move_axis
+from foco_multiplos import Center_of_Mass_foco_temp as foco_temp
 
 # ==== Configuracoes Alpaca da camera ====
 BASE_URL = "http://127.0.0.1:11111/api/v1/camera/0"
@@ -219,7 +220,7 @@ def set_camera_roi_validated(
         )
         _apply_camera_roi(w, h, start_x, start_y)
         frame_test = capture_frame(EXPOSURE_SECONDS)
-        cm = calcular_cm_corrigido(frame_test)
+        cm = medir_laser(frame_test, focus_mode)
         if cm is None:
             print("  -> sem sinal nessa ROI.")
             continue
@@ -259,10 +260,10 @@ def reset_camera_roi() -> None:
         pass
 
 
-def escolher_referencia_tracker(sensor_w: int, sensor_h: int) -> AlvoAlinhamento:
+def escolher_referencia_tracker(sensor_w: int, sensor_h: int, focus_mode: str) -> AlvoAlinhamento:
     reset_camera_roi()
     frame = capture_frame(EXPOSURE_SECONDS)
-    cm = calcular_cm_corrigido(frame)
+    cm = medir_laser(frame, focus_mode)
     if cm is None:
         cx = (sensor_w - 1) / 2
         cy = (sensor_h - 1) / 2
@@ -354,6 +355,16 @@ def calcular_cm_corrigido(frame_window: np.ndarray, threshold_percent: float = 0
     x_cm = moments["m10"] / total_intensidade
     y_cm = moments["m01"] / total_intensidade
     return x_cm, y_cm
+
+
+def medir_laser(frame_window: np.ndarray, focus_mode: str):
+    if _normalize_focus_mode(focus_mode) == "dual":
+        cm = foco_temp.centro_massa(frame_window)
+        if cm is None:
+            return None
+        return float(cm[0]), float(cm[1])
+
+    return calcular_cm_corrigido(frame_window)
 
 
 class MeasurementPDTrim:
@@ -914,9 +925,10 @@ def main():
     try:
         focus_input = input("Modo do laser (1=foco unico, 2=dupla reflexao) [1]: ").strip() or "1"
         focus_mode = _normalize_focus_mode(focus_input)
+        foco_temp.set_focus_mode(focus_mode)
         matrices = _load_tracking_calibration_matrices(focus_mode)
         sensor_w, sensor_h = get_camera_size()
-        alvo = escolher_referencia_tracker(sensor_w, sensor_h)
+        alvo = escolher_referencia_tracker(sensor_w, sensor_h, focus_mode)
 
         state = SharedState()
         usar_mount = True
@@ -985,7 +997,7 @@ def main():
             t_prev = t_now
 
             t_cm0 = time.perf_counter()
-            cm = calcular_cm_corrigido(frame_window)
+            cm = medir_laser(frame_window, focus_mode)
             last_cm_ms = (time.perf_counter() - t_cm0) * 1000.0
 
             if cm is None:

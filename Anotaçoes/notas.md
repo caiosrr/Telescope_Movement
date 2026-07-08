@@ -112,3 +112,82 @@ O autotune de dois telescopios deve ser tratado como um teste de rejeicao de per
 `telescopio 2 move o feixe -> telescopio 1 corrige com o tracker -> camera mede erro residual`
 
 Isso deve produzir parametros mais uteis para acoplamento na fibra do que o autotune antigo.
+
+## Controle futuro usando potencia da fibra
+
+Data da anotacao: 2026-07-08.
+
+A potencia medida no powermeter pode ser usada para otimizar e manter o acoplamento na fibra, mas nao funciona como um PID direto simples.
+
+No tracker da camera, o erro tem direcao:
+
+`erro_px = posicao_alvo - posicao_laser`
+
+Esse erro diz para qual lado mover o mount. Se o laser esta a direita do alvo, o controle sabe que precisa mover no sentido oposto.
+
+No powermeter, a potencia e uma medida escalar:
+
+`erro_potencia = potencia_alvo - potencia_medida`
+
+Esse valor diz que o acoplamento esta ruim ou bom, mas nao diz se o melhor movimento e `+Az`, `-Az`, `+Alt`, `-Alt` ou uma diagonal. Portanto, um PID direto usando apenas `potencia_alvo - potencia_medida` ficaria cego para a direcao.
+
+### Estrategia mais correta
+
+Usar a potencia para estimar a inclinacao local da superficie de acoplamento:
+
+1. Medir a potencia atual `P0`.
+2. Testar um pequeno movimento `+Az` e medir `P(+Az)`.
+3. Testar `-Az` e medir `P(-Az)`.
+4. Estimar `dP/dAz`.
+5. Repetir para `+Alt` e `-Alt`, estimando `dP/dAlt`.
+6. Mover na direcao em que a potencia aumenta.
+
+Isso e mais parecido com:
+
+* hill climbing;
+* gradient ascent;
+* extremum seeking control;
+* lock-in com dither.
+
+### Versao discreta atual
+
+O script `otimizacao/otimizar_receptor_local_pm100.py` faz uma busca local discreta:
+
+* mede a potencia atual;
+* testa vizinhos em Az/Alt;
+* volta para a posicao inicial de cada teste;
+* escolhe o vizinho de maior potencia;
+* aceita esse movimento;
+* repete com passos menores.
+
+Essa versao e lenta, mas segura e reversivel para bancada.
+
+### Possivel versao futura continua
+
+Criar uma malha de dither:
+
+* aplicar uma pequena oscilacao em Az e/ou Alt;
+* medir se a potencia oscila em fase ou contra-fase com o dither;
+* usar isso para descobrir o sinal do gradiente;
+* mover lentamente o mount no sentido que aumenta a potencia;
+* reduzir o passo perto do pico.
+
+Essa abordagem poderia manter o acoplamento no pico mesmo se o feixe derivar lentamente.
+
+### Estrategia com dois telescopios
+
+Quando os dois mounts estiverem disponiveis:
+
+* receptor: ajuste fino e rapido, usando camera/tracker e powermeter;
+* emissor: ajuste grosso/lento, procurando colocar o feixe dentro da regiao de captura do receptor;
+* depois que o receptor achar o pico de potencia, salvar a posicao do spot na camera como novo alvo de alinhamento;
+* o tracker deve manter o spot nesse alvo salvo, nao necessariamente no centro geometrico da camera.
+
+Uma rotina promissora:
+
+1. Usar camera/tracker para manter o spot no alvo salvo.
+2. Fazer busca por potencia no receptor.
+3. Salvar o pico encontrado como `alvo_alinhamento_camera.json`.
+4. Usar o emissor para melhorar a potencia global.
+5. Refazer ajuste fino no receptor.
+6. Repetir ate a melhora ficar pequena.

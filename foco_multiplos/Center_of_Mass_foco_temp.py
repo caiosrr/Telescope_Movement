@@ -2,6 +2,7 @@ import cv2
 import copy
 import numpy as np
 import sys
+import time
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -9,18 +10,18 @@ if not (ROOT_DIR / "Center_of_Mass.py").exists():
     ROOT_DIR = ROOT_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+FOCO_DIR = ROOT_DIR / "foco_multiplos"
 
-from Center_of_Mass import (
-    centro_camera,
+from controle.Center_of_Mass import (
     connect_camera,
     disconnect_camera,
     fetch_image_array,
     start_exposure,
     wait_until_image_ready,
 )
+from controle.alvo_alinhamento import escolher_posicao_inicial_ou_centro
 from artifact_paths import display_path, matrix_candidates
-from PID_controll import ensure_connected, ensure_not_tracking, ensure_unparked
-from mov_simultaneo import move_axes_pid_2d
+from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked, move_axes_pid_2d
 
 
 FOCUS_MODE = "single"
@@ -34,6 +35,8 @@ LOCK_MIN_SIMILARITY = 0.35
 LOCK_STRONG_SIMILARITY = 0.65
 lim_px = 2.0
 EXPOSURE_SECONDS = 32e-6
+CAPTURE_HTTP_ATTEMPTS = 3
+CAPTURE_RETRY_SLEEP_S = 0.25
 LAST_CAPTURE_STATS = {}
 LAST_RAW_FRAME = None
 LAST_FOCUS_DEBUG = {}
@@ -76,38 +79,51 @@ def reset_focus_lock() -> None:
 def capture_frame(exposure_seconds: float, light: bool = True) -> np.ndarray:
     global LAST_CAPTURE_STATS, LAST_RAW_FRAME
 
-    start_exposure(exposure_seconds, light=light)
-    wait_until_image_ready()
-    frame = fetch_image_array().astype(np.float32)
+    last_exc = None
+    for attempt in range(1, CAPTURE_HTTP_ATTEMPTS + 1):
+        try:
+            start_exposure(exposure_seconds, light=light)
+            wait_until_image_ready()
+            frame = fetch_image_array().astype(np.float32)
 
-    min_val = float(frame.min())
-    max_val = float(frame.max())
-    median_val = float(np.median(frame))
-    std_val = float(np.std(frame))
+            min_val = float(frame.min())
+            max_val = float(frame.max())
+            median_val = float(np.median(frame))
+            std_val = float(np.std(frame))
 
-    if max_val < RAW_SIGNAL_MIN or max_val <= min_val:
-        norm = np.zeros_like(frame, dtype=np.uint8)
-        pedestal = min_val
-    else:
-        pedestal = max(min_val, median_val + 0.5 * std_val)
-        if max_val <= pedestal:
-            pedestal = min_val
-        norm = np.clip((frame - pedestal) / (max_val - pedestal + 1e-6), 0, 1)
-        norm = (norm * 255).astype(np.uint8)
+            if max_val < RAW_SIGNAL_MIN or max_val <= min_val:
+                norm = np.zeros_like(frame, dtype=np.uint8)
+                pedestal = min_val
+            else:
+                pedestal = max(min_val, median_val + 0.5 * std_val)
+                if max_val <= pedestal:
+                    pedestal = min_val
+                norm = np.clip((frame - pedestal) / (max_val - pedestal + 1e-6), 0, 1)
+                norm = (norm * 255).astype(np.uint8)
 
-    norm = np.rot90(norm, 2)
-    LAST_RAW_FRAME = np.rot90(frame, 2)
-    LAST_CAPTURE_STATS = {
-        "raw_min": min_val,
-        "raw_max": max_val,
-        "raw_median": median_val,
-        "raw_std": std_val,
-        "pedestal": float(pedestal),
-        "norm_max": float(norm.max()),
-        "norm_nonzero": int(np.count_nonzero(norm)),
-    }
+            norm = np.rot90(norm, 2)
+            LAST_RAW_FRAME = np.rot90(frame, 2)
+            LAST_CAPTURE_STATS = {
+                "raw_min": min_val,
+                "raw_max": max_val,
+                "raw_median": median_val,
+                "raw_std": std_val,
+                "pedestal": float(pedestal),
+                "norm_max": float(norm.max()),
+                "norm_nonzero": int(np.count_nonzero(norm)),
+            }
 
-    return norm
+            return norm
+        except Exception as exc:
+            last_exc = exc
+            if attempt < CAPTURE_HTTP_ATTEMPTS:
+                print(
+                    f"Aviso: falha HTTP/camera na captura "
+                    f"({attempt}/{CAPTURE_HTTP_ATTEMPTS}); tentando de novo..."
+                )
+                time.sleep(CAPTURE_RETRY_SLEEP_S)
+
+    raise last_exc
 
 
 def _as_gray_float(frame: np.ndarray) -> np.ndarray:
@@ -267,6 +283,14 @@ def _select_focus_candidate(candidates: list[dict]) -> dict | None:
 
 
 def _find_focus_candidates(frame_gray: np.ndarray, threshold_percent: float) -> list[dict]:
+    """
+    Estrategia no modo dual:
+    1. thresholda a imagem suavizada e separa ilhas de pixels conectados;
+    2. trata cada ilha como um candidato a foco;
+    3. calcula o centro de massa local de cada candidato usando o sinal bruto;
+    4. a escolha nao e pela maior area, mas pela intensidade integrada
+       (raw_total) no primeiro lock e por similaridade/continuidade depois.
+    """
     max_val = float(frame_gray.max())
     if max_val <= 0:
         return []
@@ -492,14 +516,23 @@ def main() -> None:
                     f"raw_std={LAST_CAPTURE_STATS['raw_std']:.1f}, "
                     f"pedestal={LAST_CAPTURE_STATS['pedestal']:.1f}"
                 )
-            output_path = ROOT_DIR / "temporarios" / "foco_temp_ultimo_frame.png"
+            output_path = FOCO_DIR / "foco_temp_ultimo_frame.png"
             cv2.imwrite(str(output_path), frame)
             print(f"Ultimo frame salvo em: {output_path}")
             return
 
         x_cm, y_cm, intensidade, toca_borda = cm
-        cx, cy = centro_camera(frame)
+        alvo = escolher_posicao_inicial_ou_centro(
+            frame,
+            x_cm,
+            y_cm,
+            prompt="Referencia para centralizacao",
+        )
+        cx, cy = alvo.x_px, alvo.y_px
         print(f"Modo: {FOCUS_MODE}")
+        print(f"Alvo: {alvo.source} | x={cx:.2f}px y={cy:.2f}px")
+        if alvo.path is not None:
+            print(f"Arquivo do alvo: {alvo.path}")
         print(f"Centro medido: x={x_cm:.2f}px y={y_cm:.2f}px")
         print(f"Deslocamento: dx={x_cm - cx:+.2f}px dy={y_cm - cy:+.2f}px")
         print(f"Intensidade no centro: {intensidade:.1f} | toca_borda={toca_borda}")
@@ -511,7 +544,7 @@ def main() -> None:
                 f"norm_pixels_nao_zero={LAST_CAPTURE_STATS['norm_nonzero']}"
             )
 
-        output_path = ROOT_DIR / "temporarios" / "foco_temp_inicial_cm_centro.png"
+        output_path = FOCO_DIR / "foco_temp_inicial_cm_centro.png"
         _save_marked_frame(frame, output_path, cx, cy, x_cm, y_cm)
         print(f"Frame inicial salvo em: {output_path}")
 
@@ -534,7 +567,7 @@ def main() -> None:
         while True:
             dx = x_cm - cx
             dy = y_cm - cy
-            print(f"\nDeslocamento atual (cm - centro): dx = {dx:+.3f}, dy = {dy:+.3f} px")
+            print(f"\nDeslocamento atual (cm - alvo): dx = {dx:+.3f}, dy = {dy:+.3f} px")
 
             if abs(dx) <= lim_px and abs(dy) <= lim_px:
                 print("Dentro da tolerancia em pixels. Encerrando correcoes.")
@@ -555,7 +588,7 @@ def main() -> None:
             cm = centro_massa(frame)
             if cm is None:
                 print("Imagem sem sinal ou foco travado nao encontrado apos correcao; interrompendo.")
-                output_path = ROOT_DIR / "temporarios" / "foco_temp_ultimo_frame.png"
+                output_path = FOCO_DIR / "foco_temp_ultimo_frame.png"
                 cv2.imwrite(str(output_path), frame)
                 print(f"Ultimo frame salvo em: {output_path}")
                 break
@@ -565,9 +598,9 @@ def main() -> None:
         print(f"\nCM final: ({x_cm:.2f}, {y_cm:.2f})")
         dx_final = x_cm - cx
         dy_final = y_cm - cy
-        print(f"Deslocamento final (cm - centro): dx = {dx_final:+.3f}, dy = {dy_final:+.3f} px")
+        print(f"Deslocamento final (cm - alvo): dx = {dx_final:+.3f}, dy = {dy_final:+.3f} px")
 
-        output_path = ROOT_DIR / "temporarios" / "foco_temp_final_cm_trajetoria.png"
+        output_path = FOCO_DIR / "foco_temp_final_cm_trajetoria.png"
         _save_marked_frame(frame, output_path, cx, cy, x_cm, y_cm, x_cm0, y_cm0)
         print(f"Frame final salvo em: {output_path}")
     except KeyboardInterrupt:

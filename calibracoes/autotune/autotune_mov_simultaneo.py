@@ -1,5 +1,6 @@
 import json
 import math
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -7,8 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from artifact_paths import display_path, json_output_path
-from mov_simultaneo import (
+from controle.mount_control import (
     MAX_CORRECOES,
     TOLERANCIA_GRAUS,
     VEL_MAX_LIMITE,

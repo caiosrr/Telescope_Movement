@@ -1,19 +1,27 @@
 import itertools
+import sys
 import time
+from pathlib import Path
+
 import requests
 import numpy as np
 import cv2
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from artifact_paths import display_path, matrix_candidates
+from controle.alvo_alinhamento import escolher_posicao_inicial_ou_centro
 # Mantém as importações originais de conexão
-from PID_controll import (
+from controle.mount_control import (
     ensure_connected,
     ensure_unparked,
     ensure_not_tracking,
 )
 
 # IMPORTAÇÃO NOVA: Puxando a função de movimento 2D com threads que acabamos de criar
-from mov_simultaneo import move_axes_pid_2d
+from controle.mount_control import move_axes_pid_2d
 
 # ==== Configurações Alpaca ====
 BASE_URL = "http://127.0.0.1:11111/api/v1/camera/0"
@@ -167,12 +175,19 @@ def main() -> None:
         if frame_marked.ndim == 2:
             frame_marked = cv2.cvtColor(frame_marked, cv2.COLOR_GRAY2BGR)
 
-        cx, cy = centro_camera(frame)
-        print(f"Centro da câmera (x, y) em pixels: ({cx:.2f}, {cy:.2f})")
-
+        alvo = escolher_posicao_inicial_ou_centro(
+            frame,
+            x_cm,
+            y_cm,
+            prompt="Referencia para centralizacao",
+        )
+        cx, cy = alvo.x_px, alvo.y_px
+        print(f"Alvo ({alvo.source}) em pixels: ({cx:.2f}, {cy:.2f})")
+        if alvo.path is not None:
+            print(f"Arquivo do alvo: {alvo.path}")
         dx = x_cm - cx
         dy = y_cm - cy
-        print(f"Deslocamento (cm - centro) em pixels: (dx = {dx:+.3f}, dy = {dy:+.3f})")
+        print(f"Deslocamento (cm - alvo) em pixels: (dx = {dx:+.3f}, dy = {dy:+.3f})")
 
         frame_inicial = frame.copy()
         if frame_inicial.ndim == 2:
@@ -218,7 +233,7 @@ def main() -> None:
         while True:
             dx = x_cm - cx
             dy = y_cm - cy
-            print(f"\nDeslocamento atual (cm - centro): dx = {dx:+.3f}, dy = {dy:+.3f} px")
+            print(f"\nDeslocamento atual (cm - alvo): dx = {dx:+.3f}, dy = {dy:+.3f} px")
 
             if abs(dx) <= lim_px and abs(dy) <= lim_px:
                 print("Dentro da tolerância em pixels. Encerrando correções.")
@@ -246,7 +261,7 @@ def main() -> None:
         print(f"\nCM final: ({x_cm:.2f}, {y_cm:.2f})")
         dx_final = x_cm - cx
         dy_final = y_cm - cy
-        print(f"Deslocamento final (cm - centro): dx = {dx_final:+.3f}, dy = {dy_final:+.3f} px")
+        print(f"Deslocamento final (cm - alvo): dx = {dx_final:+.3f}, dy = {dy_final:+.3f} px")
 
         frame_final = frame.copy()
         if frame_final.ndim == 2:

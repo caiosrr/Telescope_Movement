@@ -1,5 +1,6 @@
 import json
 import statistics
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,10 +9,14 @@ from pathlib import Path
 
 import numpy as np
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from artifact_paths import display_path, json_output_path, matrix_candidates
-from Center_of_Mass import centro_camera, centro_massa
-from PID_controll import ensure_connected, ensure_not_tracking, ensure_unparked
-from Tracker import (
+from controle.Center_of_Mass import centro_camera, centro_massa
+from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked
+from controle.Tracker import (
     calcular_cm_corrigido,
     capture_frame,
     connect_camera,
@@ -19,7 +24,7 @@ from Tracker import (
     reset_camera_roi,
     set_camera_roi,
 )
-from mov_simultaneo import VEL_MAX_LIMITE, VEL_MIN_LIMITE, move_axis, move_axes_pid_2d
+from controle.mount_control import VEL_MAX_LIMITE, VEL_MIN_LIMITE, move_axis, move_axes_pid_2d
 
 # ===== Configuracao do experimento =====
 WINDOW_SIZE = 200

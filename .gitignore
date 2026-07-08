@@ -6,7 +6,8 @@ __pycache__/
 *.jpg
 *.jpeg
 *.mp4
-temporarios/auditoria_foco_temp*/
+foco_multiplos/auditoria_foco_temp*/
+resultados/debug/
 
 # Saidas numericas grandes/temporarias. As matrizes pequenas em resultados/matrizes
 # ficam versionadas porque o tracker pode precisar delas para rodar.

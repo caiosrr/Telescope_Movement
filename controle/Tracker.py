@@ -1,8 +1,10 @@
 import itertools
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -10,9 +12,18 @@ import requests
 
 cv2.setUseOptimized(True)
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from artifact_paths import display_path, matrix_candidates
-from PID_controll import ensure_connected, ensure_not_tracking, ensure_unparked
-from mov_simultaneo import VEL_MAX_LIMITE, VEL_MIN_LIMITE, move_axis
+from controle.alvo_alinhamento import (
+    AlvoAlinhamento,
+    escolher_posicao_inicial_ou_centro,
+    roi_incluindo_alvo,
+)
+from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked
+from controle.mount_control import VEL_MAX_LIMITE, VEL_MIN_LIMITE, move_axis
 
 # ==== Configuracoes Alpaca da camera ====
 BASE_URL = "http://127.0.0.1:11111/api/v1/camera/0"
@@ -96,19 +107,144 @@ def call(method: str, command: str, timeout: float = 5.0, **extra_args):
     return payload.get("Value")
 
 
-def set_camera_roi(w: int, h: int) -> None:
+def get_camera_size() -> tuple[int, int]:
+    max_x = int(call("GET", "cameraxsize"))
+    max_y = int(call("GET", "cameraysize"))
+    return max_x, max_y
+
+
+def _roi_params_for_target(
+    sensor_w: int,
+    sensor_h: int,
+    roi_w: int,
+    roi_h: int,
+    target_x: float,
+    target_y: float,
+    mode: str,
+) -> tuple[int, int, float, float]:
+    if mode == "rot180":
+        raw_target_x = (sensor_w - 1) - target_x
+        raw_target_y = (sensor_h - 1) - target_y
+        start_x, start_y, local_x, local_y = roi_incluindo_alvo(
+            sensor_w,
+            sensor_h,
+            roi_w,
+            roi_h,
+            raw_target_x,
+            raw_target_y,
+        )
+        return start_x, start_y, float((roi_w - 1) - local_x), float((roi_h - 1) - local_y)
+
+    start_x, start_y, local_x, local_y = roi_incluindo_alvo(
+        sensor_w,
+        sensor_h,
+        roi_w,
+        roi_h,
+        target_x,
+        target_y,
+    )
+    if mode == "direct_rotlocal":
+        return start_x, start_y, float((roi_w - 1) - local_x), float((roi_h - 1) - local_y)
+    return start_x, start_y, local_x, local_y
+
+
+def _apply_camera_roi(w: int, h: int, start_x: int, start_y: int) -> None:
+    call("PUT", "numx", data={"NumX": w})
+    call("PUT", "numy", data={"NumY": h})
+    call("PUT", "startx", data={"StartX": start_x})
+    call("PUT", "starty", data={"StartY": start_y})
+
+
+def set_camera_roi(w: int, h: int, target_x: float | None = None, target_y: float | None = None) -> tuple[int, int, float, float]:
     try:
-        max_x = int(call("GET", "cameraxsize"))
-        max_y = int(call("GET", "cameraysize"))
-        start_x = int((max_x / 2) - (w / 2))
-        start_y = int((max_y / 2) - (h / 2))
-        print(f"Cortando o sensor na fonte (Hardware ROI central): {w}x{h} px...")
-        call("PUT", "startx", data={"StartX": start_x})
-        call("PUT", "starty", data={"StartY": start_y})
-        call("PUT", "numx", data={"NumX": w})
-        call("PUT", "numy", data={"NumY": h})
+        max_x, max_y = get_camera_size()
+        if target_x is None:
+            target_x = (max_x - 1) / 2
+        if target_y is None:
+            target_y = (max_y - 1) / 2
+
+        target_x = float(np.clip(target_x, 0, max_x - 1))
+        target_y = float(np.clip(target_y, 0, max_y - 1))
+        start_x, start_y, target_x_local, target_y_local = _roi_params_for_target(
+            max_x,
+            max_y,
+            w,
+            h,
+            target_x,
+            target_y,
+            mode="rot180",
+        )
+        print(
+            f"Cortando o sensor na fonte: ROI {w}x{h} px em "
+            f"Start=({start_x}, {start_y}); alvo local=({target_x_local:.1f}, {target_y_local:.1f})"
+        )
+        _apply_camera_roi(w, h, start_x, start_y)
+        return start_x, start_y, target_x_local, target_y_local
     except Exception as exc:
         print(f"Erro ao setar ROI via hardware: {exc}")
+        return 0, 0, w / 2, h / 2
+
+
+def set_camera_roi_validated(
+    w: int,
+    h: int,
+    target_x: float,
+    target_y: float,
+    focus_mode: str,
+) -> tuple[int, int, float, float]:
+    max_x, max_y = get_camera_size()
+    target_x = float(np.clip(target_x, 0, max_x - 1))
+    target_y = float(np.clip(target_y, 0, max_y - 1))
+
+    candidates = [
+        ("rot180", "coordenada corrigida pela rotacao 180"),
+        ("direct", "coordenada direta do sensor"),
+        ("direct_rotlocal", "crop direto com alvo local invertido"),
+    ]
+    best = None
+
+    for mode, description in candidates:
+        start_x, start_y, target_x_local, target_y_local = _roi_params_for_target(
+            max_x,
+            max_y,
+            w,
+            h,
+            target_x,
+            target_y,
+            mode=mode,
+        )
+        print(
+            f"Testando ROI ({description}): Start=({start_x}, {start_y}), "
+            f"alvo local=({target_x_local:.1f}, {target_y_local:.1f})"
+        )
+        _apply_camera_roi(w, h, start_x, start_y)
+        frame_test = capture_frame(EXPOSURE_SECONDS)
+        cm = calcular_cm_corrigido(frame_test)
+        if cm is None:
+            print("  -> sem sinal nessa ROI.")
+            continue
+
+        x_cm, y_cm = cm
+        dist = float(np.hypot(x_cm - target_x_local, y_cm - target_y_local))
+        print(f"  -> sinal encontrado em ({x_cm:.1f}, {y_cm:.1f}), distancia ao alvo={dist:.1f}px")
+        if best is None or dist < best[0]:
+            best = (dist, start_x, start_y, target_x_local, target_y_local, mode, frame_test)
+
+    if best is None:
+        print("Aviso: nenhuma ROI de teste encontrou o laser; usando ROI corrigida pela rotacao.")
+        return set_camera_roi(w, h, target_x, target_y)
+
+    _, start_x, start_y, target_x_local, target_y_local, mode, frame_test = best
+    _apply_camera_roi(w, h, start_x, start_y)
+    debug_path = ROOT_DIR / "resultados" / "debug" / "tracker_roi_teste.png"
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(debug_path), frame_test)
+    print(
+        f"ROI escolhida: {mode} | Start=({start_x}, {start_y}) | "
+        f"alvo local=({target_x_local:.1f}, {target_y_local:.1f})"
+    )
+    print(f"Frame de teste da ROI salvo em: resultados\\debug\\tracker_roi_teste.png")
+    return start_x, start_y, target_x_local, target_y_local
 
 
 def reset_camera_roi() -> None:
@@ -121,6 +257,25 @@ def reset_camera_roi() -> None:
         call("PUT", "numy", data={"NumY": max_y})
     except Exception:
         pass
+
+
+def escolher_referencia_tracker(sensor_w: int, sensor_h: int) -> AlvoAlinhamento:
+    reset_camera_roi()
+    frame = capture_frame(EXPOSURE_SECONDS)
+    cm = calcular_cm_corrigido(frame)
+    if cm is None:
+        cx = (sensor_w - 1) / 2
+        cy = (sensor_h - 1) / 2
+        print("Nao encontrei o laser no frame inicial; usando centro da camera.")
+        return AlvoAlinhamento(x_px=float(cx), y_px=float(cy), source="camera_center")
+
+    x_cm, y_cm = cm
+    return escolher_posicao_inicial_ou_centro(
+        frame,
+        float(x_cm),
+        float(y_cm),
+        prompt="Referencia do tracker",
+    )
 
 
 def connect_camera() -> None:
@@ -760,6 +915,8 @@ def main():
         focus_input = input("Modo do laser (1=foco unico, 2=dupla reflexao) [1]: ").strip() or "1"
         focus_mode = _normalize_focus_mode(focus_input)
         matrices = _load_tracking_calibration_matrices(focus_mode)
+        sensor_w, sensor_h = get_camera_size()
+        alvo = escolher_referencia_tracker(sensor_w, sensor_h)
 
         state = SharedState()
         usar_mount = True
@@ -782,9 +939,18 @@ def main():
             f"Matrizes carregadas | fine: {matrices['fine_path']} | "
             f"coarse: {matrices['coarse_path']}"
         )
+        print(f"Alvo do tracker: {alvo.source} | x={alvo.x_px:.2f}px y={alvo.y_px:.2f}px")
+        if alvo.path is not None:
+            print(f"Arquivo do alvo: {alvo.path}")
         print("Pressione q para encerrar.\n")
 
-        set_camera_roi(WINDOW_SIZE, WINDOW_SIZE)
+        roi_start_x, roi_start_y, target_x_local, target_y_local = set_camera_roi_validated(
+            WINDOW_SIZE,
+            WINDOW_SIZE,
+            alvo.x_px,
+            alvo.y_px,
+            focus_mode,
+        )
 
         t_prev = time.perf_counter()
         tempos_loop = []
@@ -799,8 +965,8 @@ def main():
         last_recenter_elapsed = None
         scale_upscale = TARGET_H / WINDOW_SIZE
         target_w = int(WINDOW_SIZE * scale_upscale)
-        cx_L = int((WINDOW_SIZE / 2) * scale_upscale)
-        cy_L = int((WINDOW_SIZE / 2) * scale_upscale)
+        cx_L = int(target_x_local * scale_upscale)
+        cy_L = int(target_y_local * scale_upscale)
         display_interval_s = 1.0 / DISPLAY_HZ
         last_display_t = 0.0
         display_frames = 0
@@ -825,8 +991,8 @@ def main():
             if cm is None:
                 dx = 0.0
                 dy = 0.0
-                x_cm_local = WINDOW_SIZE / 2
-                y_cm_local = WINDOW_SIZE / 2
+                x_cm_local = target_x_local
+                y_cm_local = target_y_local
                 cor_laser = (0, 0, 255)
 
                 with state.lock:
@@ -850,8 +1016,8 @@ def main():
                     recenter_center_hold_start = None
             else:
                 x_cm_local, y_cm_local = cm
-                dx = float(x_cm_local - (WINDOW_SIZE / 2))
-                dy = float(y_cm_local - (WINDOW_SIZE / 2))
+                dx = float(x_cm_local - target_x_local)
+                dy = float(y_cm_local - target_y_local)
 
                 with state.lock:
                     if state.measurement_seq == 0 or not state.has_signal:

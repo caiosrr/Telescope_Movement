@@ -1,8 +1,14 @@
 import json
+import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from artifact_paths import (
     display_path,
@@ -11,9 +17,8 @@ from artifact_paths import (
     matrix_candidates,
     matrix_output_path,
 )
-from Center_of_Mass import capture_frame, centro_massa, connect_camera, disconnect_camera
-from PID_controll import ensure_connected, ensure_not_tracking, ensure_unparked
-from mov_simultaneo import move_axes_pid_2d
+from controle.Center_of_Mass import capture_frame, centro_massa, connect_camera, disconnect_camera
+from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked, move_axes_pid_2d
 
 EXPOSURE_SECONDS = 32e-6
 SETTLE_S = 0.50

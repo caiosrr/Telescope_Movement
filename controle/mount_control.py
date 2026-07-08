@@ -349,7 +349,6 @@ def main():
 
     print("=== Movimento PID 2D Simultâneo ===\n")
     mount = bool(int(input("mount 1, simulador 0: ")))
-
     while True:
         try:
             az, alt = read_altaz()

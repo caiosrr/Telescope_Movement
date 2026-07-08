@@ -21,7 +21,7 @@ from artifact_paths import (
     matrix_candidates,
     matrix_output_path,
 )
-from Center_of_Mass_foco_temp import (
+from foco_multiplos.Center_of_Mass_foco_temp import (
     capture_frame,
     centro_massa,
     connect_camera,
@@ -30,8 +30,9 @@ from Center_of_Mass_foco_temp import (
     get_focus_mode,
     set_focus_mode,
 )
-from PID_controll import ensure_connected, ensure_not_tracking, ensure_unparked
-from mov_simultaneo import move_axes_pid_2d
+from controle.mount_control import ensure_connected, ensure_not_tracking, ensure_unparked, move_axes_pid_2d
+
+FOCO_DIR = ROOT_DIR / "foco_multiplos"
 
 EXPOSURE_SECONDS = 32e-6
 SETTLE_S = 0.50
@@ -172,7 +173,14 @@ def _capture_cm_estavel(exposure: float, repeats: int, audit_tag: str) -> Medica
     toca_borda = False
 
     for repeat_idx in range(repeats):
-        frame = capture_frame(exposure, light=True)
+        try:
+            frame = capture_frame(exposure, light=True)
+        except Exception as exc:
+            print(
+                f"  -> captura falhou em {audit_tag} "
+                f"({repeat_idx + 1}/{repeats}): {exc}"
+            )
+            return None
         cm = centro_massa(frame)
         debug = get_focus_debug()
         _audit_capture(audit_tag, repeat_idx, frame, cm, debug)
@@ -225,13 +233,27 @@ def _collect_bracketed_sample(
         print(f"  -> centro antes tocou borda em {label}; descartando.")
         return None
 
-    _move_and_settle(mount, target_az_deg, target_alt_deg)
-    target_cm = _capture_cm_estavel(
-        exposure,
-        CAPTURES_PER_POINT,
-        audit_tag=f"{tag_base}_target",
-    )
-    _move_and_settle(mount, -target_az_deg, -target_alt_deg)
+    target_cm = None
+    returned_to_center = False
+    try:
+        _move_and_settle(mount, target_az_deg, target_alt_deg)
+        target_cm = _capture_cm_estavel(
+            exposure,
+            CAPTURES_PER_POINT,
+            audit_tag=f"{tag_base}_target",
+        )
+    except Exception as exc:
+        print(f"  -> erro durante movimento/captura do ponto {label}: {exc}")
+    finally:
+        try:
+            _move_and_settle(mount, -target_az_deg, -target_alt_deg)
+            returned_to_center = True
+        except Exception as exc:
+            print(f"  -> erro voltando ao centro apos {label}: {exc}")
+
+    if not returned_to_center:
+        return None
+
     center_after = _capture_cm_estavel(
         exposure,
         CAPTURES_PER_CENTER,
@@ -569,7 +591,7 @@ def main():
     focus_mode = set_focus_mode(focus_input)
     mount = True
     AUDIT_LOG = []
-    AUDIT_DIR = ROOT_DIR / "temporarios" / "auditoria_foco_temp"
+    AUDIT_DIR = FOCO_DIR / "auditoria_foco_temp"
     if AUDIT_DIR.exists():
         shutil.rmtree(AUDIT_DIR)
     AUDIT_DIR.mkdir(parents=True, exist_ok=True)
@@ -648,7 +670,10 @@ def main():
     except Exception as exc:
         print(f"\nErro na calibracao dual V3: {exc}")
     finally:
-        disconnect_camera()
+        try:
+            disconnect_camera()
+        except Exception as exc:
+            print(f"Aviso: nao consegui desconectar a camera pelo Alpaca: {exc}")
 
 
 if __name__ == "__main__":

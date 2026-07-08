@@ -1,12 +1,17 @@
 import json
 import math
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from artifact_paths import display_path, json_candidates, json_output_path
-from autotune_mov_simultaneo import (
+from calibracoes.autotune.autotune_mov_simultaneo import (
     MoveTrialResult,
     TestMove,
     TunedParams,

@@ -10,6 +10,7 @@ Controle, calibracao e tracking para testes de apontamento com telescopios, came
 - `foco_multiplos/`: fluxo para imagens com dois ou mais focos/reflexoes; tambem funciona para foco unico e pode virar o padrao.
 - `calibracoes/autotune/`: autotunes, validacoes e buscas de parametros.
 - `calibracoes/legado/`: versoes antigas ou experimentais mantidas como referencia.
+- `otimizacao/`: scripts que usam power meter/camera como metrica para maximizar acoplamento.
 - `ferramentas/`: scripts de bancada/diagnostico, como definir alvo da fibra e diagnosticar mounts.
 - `resultados/matrizes/`: matrizes usadas pelos scripts.
 - `resultados/json/`: resultados de execucao e logs em JSON.
@@ -27,6 +28,7 @@ python .\controle\mov_mount_remoto.py
 python .\ferramentas\definir_alvo_fibra.py
 python .\ferramentas\diagnostico_mounts.py
 python .\calibracoes\autotune\autotune_mov_mount_remoto.py
+python .\otimizacao\otimizar_acoplamento_pm100.py
 ```
 
 ## Observacoes

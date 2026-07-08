@@ -20,9 +20,10 @@ from otimizacao.otimizar_acoplamento_pm100 import PM100Reader
 DEFAULT_WAVELENGTH_NM = 632.8
 DEFAULT_SETTLE_S = 0.8
 DEFAULT_SAMPLES = 7
-DEFAULT_WARMUP_SAMPLES = 3
+DEFAULT_WARMUP_SAMPLES = 5
 DEFAULT_STEPS = "0.02,0.01,0.005,0.002"
 DEFAULT_CAMERA_EXPOSURE_S = 32e-6
+MIN_ACCEPT_IMPROVEMENT_UW = 0.002
 RESULTS_JSON = json_output_path("otimizacao_receptor_local_pm100.json")
 CAMERA_TARGET_DEBUG = ROOT_DIR / "resultados" / "debug" / "otimizacao_receptor_alvo_camera.png"
 
@@ -45,6 +46,19 @@ class Trial:
     delta_alt_deg: float
     power_uw: float
     accepted: bool
+    timestamp_epoch: float
+
+
+@dataclass
+class AcceptedMove:
+    cycle: int
+    step_deg: float
+    delta_az_deg: float
+    delta_alt_deg: float
+    baseline_before_uw: float
+    baseline_after_scan_uw: float
+    candidate_uw: float
+    confirmed_uw: float
     timestamp_epoch: float
 
 
@@ -131,16 +145,24 @@ def optimize_local_receiver(
     samples: int,
     warmup_samples: int,
     settle_s: float,
-) -> tuple[list[Measurement], list[Trial]]:
+) -> tuple[list[Measurement], list[Trial], list[AcceptedMove]]:
     measurements: list[Measurement] = []
     trials: list[Trial] = []
+    accepted_moves: list[AcceptedMove] = []
 
-    current_uw = measure_pm(pm, samples, warmup_samples, "inicial", measurements)
+    measure_pm(pm, samples, warmup_samples, "inicial", measurements)
 
     for cycle in range(1, cycles + 1):
         print(f"\n=== Ciclo {cycle}/{cycles} ===")
         for step in steps:
             print(f"\nBusca local com passo {step:.5f} deg")
+            baseline_before_uw = measure_pm(
+                pm,
+                samples,
+                warmup_samples,
+                f"baseline ciclo={cycle} step={step:.5f}",
+                measurements,
+            )
             candidates = [
                 (0.0, 0.0),
                 (+step, 0.0),
@@ -155,7 +177,7 @@ def optimize_local_receiver(
 
             best_az = 0.0
             best_alt = 0.0
-            best_uw = current_uw
+            best_uw = baseline_before_uw
 
             for offset_az, offset_alt in candidates[1:]:
                 power_uw = test_offset(
@@ -175,21 +197,55 @@ def optimize_local_receiver(
                     best_az = offset_az
                     best_alt = offset_alt
 
+            baseline_after_scan_uw = measure_pm(
+                pm,
+                samples,
+                warmup_samples,
+                f"baseline apos varredura ciclo={cycle} step={step:.5f}",
+                measurements,
+            )
+            acceptance_reference_uw = baseline_after_scan_uw
+            improvement_uw = best_uw - acceptance_reference_uw
+
             if best_az == 0.0 and best_alt == 0.0:
-                print(f"Sem melhora para passo {step:.5f}; mantendo posicao.")
+                print(
+                    f"Sem candidato melhor que o baseline para passo {step:.5f}; "
+                    f"baseline={acceptance_reference_uw:.5f} uW."
+                )
+                continue
+
+            if improvement_uw < MIN_ACCEPT_IMPROVEMENT_UW:
+                print(
+                    f"Melhor candidato nao passou margem minima: "
+                    f"{best_uw:.5f} contra baseline {acceptance_reference_uw:.5f} uW "
+                    f"(ganho {improvement_uw:+.5f} uW). Mantendo posicao."
+                )
                 continue
 
             print(
                 f"Melhor vizinho: dAz={best_az:+.5f} dAlt={best_alt:+.5f} "
-                f"| {current_uw:.5f} -> {best_uw:.5f} uW"
+                f"| baseline {acceptance_reference_uw:.5f} -> candidato {best_uw:.5f} uW"
             )
             move_local(best_az, best_alt, settle_s)
-            current_uw = measure_pm(
+            confirmed_uw = measure_pm(
                 pm,
                 samples,
                 warmup_samples,
                 "apos aceitar melhor vizinho",
                 measurements,
+            )
+            accepted_moves.append(
+                AcceptedMove(
+                    cycle=cycle,
+                    step_deg=step,
+                    delta_az_deg=best_az,
+                    delta_alt_deg=best_alt,
+                    baseline_before_uw=baseline_before_uw,
+                    baseline_after_scan_uw=baseline_after_scan_uw,
+                    candidate_uw=best_uw,
+                    confirmed_uw=confirmed_uw,
+                    timestamp_epoch=time.time(),
+                )
             )
 
             for trial in reversed(trials):
@@ -202,7 +258,7 @@ def optimize_local_receiver(
                     trial.accepted = True
                     break
 
-    return measurements, trials
+    return measurements, trials, accepted_moves
 
 
 def save_camera_target_at_current_position(focus_mode: str, exposure_s: float) -> None:
@@ -248,7 +304,13 @@ def save_camera_target_at_current_position(focus_mode: str, exposure_s: float) -
         foco_temp.disconnect_camera()
 
 
-def save_results(pm: PM100Reader, measurements: list[Measurement], trials: list[Trial], args) -> None:
+def save_results(
+    pm: PM100Reader,
+    measurements: list[Measurement],
+    trials: list[Trial],
+    accepted_moves: list[AcceptedMove],
+    args,
+) -> None:
     payload = {
         "timestamp_epoch": time.time(),
         "pm100_resource": pm.resource_name,
@@ -259,8 +321,10 @@ def save_results(pm: PM100Reader, measurements: list[Measurement], trials: list[
         "samples": args.samples,
         "warmup_samples": args.warmup_samples,
         "settle_s": args.settle_s,
+        "min_accept_improvement_uw": MIN_ACCEPT_IMPROVEMENT_UW,
         "measurements": [asdict(item) for item in measurements],
         "trials": [asdict(item) for item in trials],
+        "accepted_moves": [asdict(item) for item in accepted_moves],
     }
     RESULTS_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"\nLog salvo em: {RESULTS_JSON}")
@@ -301,8 +365,9 @@ def main() -> None:
 
     measurements: list[Measurement] = []
     trials: list[Trial] = []
+    accepted_moves: list[AcceptedMove] = []
     try:
-        measurements, trials = optimize_local_receiver(
+        measurements, trials, accepted_moves = optimize_local_receiver(
             pm=pm,
             steps=parse_steps(args.steps),
             cycles=args.cycles,
@@ -320,10 +385,13 @@ def main() -> None:
             pass
         if not args.no_save_camera_target:
             try:
-                save_camera_target_at_current_position(args.focus_mode, args.camera_exposure_s)
+                if accepted_moves:
+                    save_camera_target_at_current_position(args.focus_mode, args.camera_exposure_s)
+                else:
+                    print("Nenhum movimento foi aceito; alvo da camera nao foi sobrescrito.")
             except Exception as exc:
                 print(f"Aviso: nao consegui salvar alvo da camera: {exc}")
-        save_results(pm, measurements, trials, args)
+        save_results(pm, measurements, trials, accepted_moves, args)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ resultados/debug/
 resultados/json/*.json
 
 # Arquivos locais de editor/sistema.
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .idea/
 Thumbs.db
 .DS_Store

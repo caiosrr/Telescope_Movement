@@ -54,7 +54,7 @@ EXPOSURE_SECONDS = 32e-6
 TOLERANCIA_PX = 2.0
 CONTROL_DEADBAND_PX = 0.35
 RECENTER_SETTLE_S = 1.0
-PRE_PERTURB_TRACK_S = 0.8
+PRE_PERTURB_TRACK_S = 1.2
 TRACKER_TIMEOUT_S = 12.0
 CONTROL_HZ = 45.0
 SIGNAL_TIMEOUT_S = 0.45
@@ -118,13 +118,13 @@ INITIAL_MEASUREMENT_ALPHA = 0.70
 INITIAL_CMD_ACCEL_LIMIT = 2.00
 
 INITIAL_DP = {
-    "kp_az": 0.10,
-    "kp_alt": 0.10,
-    "kd_az": 0.03,
-    "kd_alt": 0.03,
-    "trim_gain": 0.60,
-    "measurement_alpha": 0.08,
-    "cmd_accel_limit": 0.45,
+    "kp_az": 0.06,
+    "kp_alt": 0.06,
+    "kd_az": 0.02,
+    "kd_alt": 0.02,
+    "trim_gain": 0.35,
+    "measurement_alpha": 0.05,
+    "cmd_accel_limit": 0.30,
 }
 
 PARAM_BOUNDS = {
@@ -242,13 +242,16 @@ class CandidateEvaluation:
     trials: list[TrialResult]
 
 
+PERTURB_AXIS_DEG = 0.010
+PERTURB_DIAG_DEG = 0.007
+
 PERTURBATIONS = [
-    Perturbation("+Alt", 0.0, +0.020),
-    Perturbation("-Az", -0.020, 0.0),
-    Perturbation("+Az", +0.020, 0.0),
-    Perturbation("-Alt", 0.0, -0.020),
-    Perturbation("+Az+Alt", +0.014, +0.014),
-    Perturbation("-Az-Alt", -0.014, -0.014),
+    Perturbation("+Alt", 0.0, +PERTURB_AXIS_DEG),
+    Perturbation("-Az", -PERTURB_AXIS_DEG, 0.0),
+    Perturbation("+Az", +PERTURB_AXIS_DEG, 0.0),
+    Perturbation("-Alt", 0.0, -PERTURB_AXIS_DEG),
+    Perturbation("+Az+Alt", +PERTURB_DIAG_DEG, +PERTURB_DIAG_DEG),
+    Perturbation("-Az-Alt", -PERTURB_DIAG_DEG, -PERTURB_DIAG_DEG),
 ]
 
 
@@ -1920,7 +1923,11 @@ def main():
         print(f"  Modo foco:   {focus_mode}")
         print(f"  Matriz fine:   {matrices['fine_path']}")
         print(f"  Matriz coarse: {matrices['coarse_path']}")
-        print(f"  Perturbacoes: {', '.join(p.name for p in PERTURBATIONS)}")
+        perturbation_desc = ", ".join(
+            f"{p.name}(dAz={p.delta_az_deg:+.4f}, dAlt={p.delta_alt_deg:+.4f})"
+            for p in PERTURBATIONS
+        )
+        print(f"  Perturbacoes: {perturbation_desc}")
         print(
             "\nO tracker fica ativo no T1 antes da perturbacao; "
             "o T2 se move enquanto a camera continua medindo."

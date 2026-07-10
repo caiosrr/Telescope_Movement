@@ -1,5 +1,4 @@
 import json
-import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -35,9 +34,16 @@ from controle.mount_control import ensure_connected, ensure_not_tracking, ensure
 FOCO_DIR = ROOT_DIR / "foco_multiplos"
 
 EXPOSURE_SECONDS = 32e-6
-SETTLE_S = 0.50
+SETTLE_S = 1.50
 CAPTURES_PER_CENTER = 2
 CAPTURES_PER_POINT = 2
+MAX_SAMPLE_ATTEMPTS = 3
+CENTER_DRIFT_WEIGHT = 0.50
+DISCONNECT_CAMERA_ON_EXIT = True
+DRIFT_LIMITS_PX = {
+    "coarse": {"accept": 10.0, "warn": 15.0},
+    "fine": {"accept": 6.0, "warn": 10.0},
+}
 MAX_COND = 1.0e4
 MIN_SPREAD_DEG = 0.008
 ROBUST_ITERS = 8
@@ -103,6 +109,7 @@ class RegistroDual:
     target_std_y_px: float
     corrected_x_px: float
     corrected_y_px: float
+    center_drift_px: float
     jitter_px: float
 
 
@@ -210,7 +217,7 @@ def _move_and_settle(mount: bool, delta_az: float, delta_alt: float):
     time.sleep(SETTLE_S)
 
 
-def _collect_bracketed_sample(
+def _collect_bracketed_sample_once(
     regime: str,
     label: str,
     radius_deg: float,
@@ -218,8 +225,9 @@ def _collect_bracketed_sample(
     target_alt_deg: float,
     exposure: float,
     mount: bool,
+    attempt_idx: int,
 ) -> RegistroDual | None:
-    tag_base = f"{regime}_{label}"
+    tag_base = f"{regime}_{label}_try{attempt_idx + 1:02d}"
 
     center_before = _capture_cm_estavel(
         exposure,
@@ -273,6 +281,12 @@ def _collect_bracketed_sample(
         print(f"  -> centro depois tocou borda em {label}; descartando.")
         return None
 
+    center_drift_px = float(
+        np.hypot(
+            center_after.x_px - center_before.x_px,
+            center_after.y_px - center_before.y_px,
+        )
+    )
     x_ref = 0.5 * (center_before.x_px + center_after.x_px)
     y_ref = 0.5 * (center_before.y_px + center_after.y_px)
     corrected_x = target_cm.x_px - x_ref
@@ -282,6 +296,7 @@ def _collect_bracketed_sample(
         np.hypot(target_cm.std_x_px, target_cm.std_y_px)
         + 0.5 * np.hypot(center_before.std_x_px, center_before.std_y_px)
         + 0.5 * np.hypot(center_after.std_x_px, center_after.std_y_px)
+        + CENTER_DRIFT_WEIGHT * center_drift_px
     )
 
     return RegistroDual(
@@ -304,8 +319,52 @@ def _collect_bracketed_sample(
         target_std_y_px=target_cm.std_y_px,
         corrected_x_px=float(corrected_x),
         corrected_y_px=float(corrected_y),
+        center_drift_px=center_drift_px,
         jitter_px=float(jitter_px),
     )
+
+
+def _collect_bracketed_sample(
+    regime: str,
+    label: str,
+    radius_deg: float,
+    target_az_deg: float,
+    target_alt_deg: float,
+    exposure: float,
+    mount: bool,
+) -> RegistroDual | None:
+    limits = DRIFT_LIMITS_PX[regime]
+    best_record = None
+
+    for attempt_idx in range(MAX_SAMPLE_ATTEMPTS):
+        if attempt_idx > 0:
+            print(f"  -> repetindo {label}: drift alto na tentativa anterior.")
+        registro = _collect_bracketed_sample_once(
+            regime=regime,
+            label=label,
+            radius_deg=radius_deg,
+            target_az_deg=target_az_deg,
+            target_alt_deg=target_alt_deg,
+            exposure=exposure,
+            mount=mount,
+            attempt_idx=attempt_idx,
+        )
+        if registro is None:
+            continue
+        if best_record is None or registro.center_drift_px < best_record.center_drift_px:
+            best_record = registro
+        if registro.center_drift_px <= limits["accept"]:
+            return registro
+
+    if best_record is None:
+        return None
+
+    if best_record.center_drift_px >= limits["warn"]:
+        print(
+            f"  -> aviso: usando {label} com drift centro alto "
+            f"({best_record.center_drift_px:.2f}px); peso reduzido no ajuste."
+        )
+    return best_record
 
 
 def _build_star_sequence(radii_deg: list[float]):
@@ -354,7 +413,8 @@ def _collect_regime(
         registros.append(registro)
         print(
             f"  -> corrigido: x={registro.corrected_x_px:+.2f}px "
-            f"y={registro.corrected_y_px:+.2f}px | jitter={registro.jitter_px:.2f}px"
+            f"y={registro.corrected_y_px:+.2f}px | "
+            f"drift={registro.center_drift_px:.2f}px | jitter={registro.jitter_px:.2f}px"
         )
 
     print(f"Registros validos {regime}: {len(registros)}")
@@ -518,7 +578,7 @@ def _compare_with_existing(existing, coarse_result, fine_result, coarse_records,
     return comparison
 
 
-def _save_dual_results(coarse_result, fine_result, coarse_records, fine_records, comparison, output_dir="."):
+def _save_dual_results(coarse_result, fine_result, coarse_records, fine_records, comparison, output_dir=None):
     coarse_a_path = matrix_output_path(COARSE_A_PATH, output_dir)
     coarse_a_inv_path = matrix_output_path(COARSE_A_INV_PATH, output_dir)
     fine_a_path = matrix_output_path(FINE_A_PATH, output_dir)
@@ -536,6 +596,9 @@ def _save_dual_results(coarse_result, fine_result, coarse_records, fine_records,
             "settle_s": SETTLE_S,
             "captures_per_center": CAPTURES_PER_CENTER,
             "captures_per_point": CAPTURES_PER_POINT,
+            "max_sample_attempts": MAX_SAMPLE_ATTEMPTS,
+            "center_drift_weight": CENTER_DRIFT_WEIGHT,
+            "drift_limits_px": DRIFT_LIMITS_PX,
             "coarse_radii_deg": COARSE_RADII_DEG,
             "fine_radii_deg": FINE_RADII_DEG,
             "directions": DIRECTIONS,
@@ -580,6 +643,20 @@ def _print_summary(name: str, result):
         print(f"  -> {result['quality_warning']}")
 
 
+def _novo_diretorio_auditoria() -> Path:
+    base_dir = FOCO_DIR / "auditoria_foco_temp"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    for suffix in range(100):
+        run_name = f"run_{timestamp}" if suffix == 0 else f"run_{timestamp}_{suffix:02d}"
+        audit_dir = base_dir / run_name
+        try:
+            audit_dir.mkdir(parents=True, exist_ok=False)
+            return audit_dir
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"Nao consegui criar diretorio unico de auditoria em {base_dir}")
+
+
 def main():
     global AUDIT_DIR, AUDIT_LOG
 
@@ -591,10 +668,7 @@ def main():
     focus_mode = set_focus_mode(focus_input)
     mount = True
     AUDIT_LOG = []
-    AUDIT_DIR = FOCO_DIR / "auditoria_foco_temp"
-    if AUDIT_DIR.exists():
-        shutil.rmtree(AUDIT_DIR)
-    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIT_DIR = _novo_diretorio_auditoria()
 
     print(f"Modo de foco temporario: {focus_mode}")
     print("Usando montagem real. Esta versao temporaria nao pergunta por simulador.")
@@ -658,11 +732,11 @@ def main():
 
         print(
             f"\nArquivos salvos: "
-            f"{display_path(matrix_output_path(COARSE_A_PATH))}, "
-            f"{display_path(matrix_output_path(COARSE_A_INV_PATH))}, "
-            f"{display_path(matrix_output_path(FINE_A_PATH))}, "
-            f"{display_path(matrix_output_path(FINE_A_INV_PATH))}, "
-            f"{display_path(json_output_path(f'{OUTPUT_PREFIX}_meta.json'))}"
+            f"{display_path(matrix_output_path(COARSE_A_PATH, ROOT_DIR))}, "
+            f"{display_path(matrix_output_path(COARSE_A_INV_PATH, ROOT_DIR))}, "
+            f"{display_path(matrix_output_path(FINE_A_PATH, ROOT_DIR))}, "
+            f"{display_path(matrix_output_path(FINE_A_INV_PATH, ROOT_DIR))}, "
+            f"{display_path(json_output_path(f'{OUTPUT_PREFIX}_meta.json', ROOT_DIR))}"
         )
 
     except KeyboardInterrupt:
@@ -670,10 +744,13 @@ def main():
     except Exception as exc:
         print(f"\nErro na calibracao dual V3: {exc}")
     finally:
-        try:
-            disconnect_camera()
-        except Exception as exc:
-            print(f"Aviso: nao consegui desconectar a camera pelo Alpaca: {exc}")
+        if DISCONNECT_CAMERA_ON_EXIT:
+            try:
+                disconnect_camera()
+            except Exception as exc:
+                print(f"Aviso: nao consegui desconectar a camera pelo Alpaca: {exc}")
+        else:
+            print("Camera mantida conectada ao final da calibracao.")
 
 
 if __name__ == "__main__":

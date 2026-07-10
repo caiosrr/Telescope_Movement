@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 
 # Imagens, videos e auditorias geradas em bancada.
 *.png

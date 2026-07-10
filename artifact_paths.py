@@ -10,7 +10,10 @@ MATRICES_DIRNAME = "matrizes"
 def _resolve_base_dir(base_dir: str | Path | None = None) -> Path:
     if base_dir is None:
         return ROOT_DIR
-    return Path(base_dir).resolve()
+    path = Path(base_dir)
+    if path.is_absolute():
+        return path.resolve()
+    return (ROOT_DIR / path).resolve()
 
 
 def json_dir(base_dir: str | Path | None = None) -> Path:

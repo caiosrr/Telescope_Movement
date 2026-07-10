@@ -36,7 +36,8 @@ LOCK_STRONG_SIMILARITY = 0.65
 lim_px = 2.0
 EXPOSURE_SECONDS = 32e-6
 CAPTURE_HTTP_ATTEMPTS = 3
-CAPTURE_RETRY_SLEEP_S = 0.25
+CAPTURE_RETRY_SLEEP_S = 0.75
+CAPTURE_COOLDOWN_SLEEP_S = 0.05
 LAST_CAPTURE_STATS = {}
 LAST_RAW_FRAME = None
 LAST_FOCUS_DEBUG = {}
@@ -113,6 +114,8 @@ def capture_frame(exposure_seconds: float, light: bool = True) -> np.ndarray:
                 "norm_nonzero": int(np.count_nonzero(norm)),
             }
 
+            if CAPTURE_COOLDOWN_SLEEP_S > 0:
+                time.sleep(CAPTURE_COOLDOWN_SLEEP_S)
             return norm
         except Exception as exc:
             last_exc = exc

@@ -38,6 +38,13 @@ EXPOSURE_SECONDS = 32e-6
 CAPTURE_HTTP_ATTEMPTS = 3
 CAPTURE_RETRY_SLEEP_S = 0.75
 CAPTURE_COOLDOWN_SLEEP_S = 0.05
+FINE_MATRIX_ENTER_RADIUS_PX = 8.0
+CENTERING_STEP_GAIN = 0.65
+MAX_CORRECTION_NORM_DEG = 0.015
+MAX_CENTERING_ITERS = 8
+WORSE_ABORT_FACTOR = 1.25
+WORSE_ABORT_MARGIN_PX = 6.0
+ROLLBACK_ON_WORSE = True
 LAST_CAPTURE_STATS = {}
 LAST_RAW_FRAME = None
 LAST_FOCUS_DEBUG = {}
@@ -441,30 +448,69 @@ def centro_massa(frame: np.ndarray, threshold_percent: float | None = None):
     return cm
 
 
-def _load_A_inv() -> np.ndarray | None:
-    candidates = matrix_candidates(
-        "foco_temp_A_inv_fine.npy",
-        "foco_temp_A_inv_coarse.npy",
-        "A_inv_fine.npy",
-        "A_inv_coarse.npy",
-        "calibracao_A_inv.npy",
-    )
+def _load_calibration_matrices() -> dict[str, tuple[np.ndarray, str]] | None:
+    matrix_sets = {
+        "fine": matrix_candidates(
+            "foco_temp_A_inv_fine.npy",
+            "A_inv_fine.npy",
+            "calibracao_A_inv.npy",
+        ),
+        "coarse": matrix_candidates(
+            "foco_temp_A_inv_coarse.npy",
+            "A_inv_coarse.npy",
+            "calibracao_A_inv.npy",
+        ),
+    }
 
+    loaded = {}
     try:
-        for candidate in candidates:
-            if not candidate.exists():
-                continue
-            A_inv = np.load(candidate)
-            if A_inv.shape != (2, 2):
-                raise ValueError(f"Matriz {display_path(candidate)} com shape invalido.")
-            print(f"Matriz carregada: {display_path(candidate)}")
-            return A_inv
+        for label, candidates in matrix_sets.items():
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+                A_inv = np.load(candidate)
+                if A_inv.shape != (2, 2):
+                    raise ValueError(f"Matriz {display_path(candidate)} com shape invalido.")
+                loaded[label] = (A_inv, display_path(candidate))
+                print(f"Matriz {label} carregada: {display_path(candidate)}")
+                break
 
-        raise FileNotFoundError(f"Testei: {', '.join(str(path) for path in candidates)}")
+        if not loaded:
+            tested = [str(path) for paths in matrix_sets.values() for path in paths]
+            raise FileNotFoundError(f"Testei: {', '.join(tested)}")
+
+        if "coarse" not in loaded and "fine" in loaded:
+            loaded["coarse"] = loaded["fine"]
+            print("Aviso: matriz coarse nao encontrada; usando fine como fallback.")
+        if "fine" not in loaded and "coarse" in loaded:
+            loaded["fine"] = loaded["coarse"]
+            print("Aviso: matriz fine nao encontrada; usando coarse como fallback.")
+
+        return loaded
     except Exception as exc:
         print(f"\nNao foi possivel carregar a matriz de centralizacao: {exc}")
         print("Execute primeiro a calibracao 2D para gerar este arquivo.")
         return None
+
+
+def _select_A_inv(
+    matrices: dict[str, tuple[np.ndarray, str]],
+    radius_px: float,
+) -> tuple[str, np.ndarray]:
+    if radius_px <= FINE_MATRIX_ENTER_RADIUS_PX and "fine" in matrices:
+        return "fine", matrices["fine"][0]
+    return "coarse", matrices["coarse"][0]
+
+
+def _limit_correction(daz_deg: float, dalt_deg: float) -> tuple[float, float, float]:
+    correction = np.array([daz_deg, dalt_deg], dtype=float) * CENTERING_STEP_GAIN
+    norm = float(np.hypot(correction[0], correction[1]))
+    scale = CENTERING_STEP_GAIN
+    if norm > MAX_CORRECTION_NORM_DEG:
+        limit_scale = MAX_CORRECTION_NORM_DEG / max(norm, 1e-12)
+        correction *= limit_scale
+        scale *= limit_scale
+    return float(correction[0]), float(correction[1]), float(scale)
 
 
 def _save_marked_frame(
@@ -530,6 +576,7 @@ def main() -> None:
             x_cm,
             y_cm,
             prompt="Referencia para centralizacao",
+            default_choice="3",
         )
         cx, cy = alvo.x_px, alvo.y_px
         print(f"Modo: {FOCUS_MODE}")
@@ -556,8 +603,8 @@ def main() -> None:
             print("Centralizacao automatica cancelada pelo usuario.")
             return
 
-        A_inv = _load_A_inv()
-        if A_inv is None:
+        matrices = _load_calibration_matrices()
+        if matrices is None:
             return
 
         ensure_connected()
@@ -567,21 +614,36 @@ def main() -> None:
         x_cm0, y_cm0 = x_cm, y_cm
         usar_mount = True
 
-        while True:
+        for iter_idx in range(1, MAX_CENTERING_ITERS + 1):
             dx = x_cm - cx
             dy = y_cm - cy
+            radius_px = float(np.hypot(dx, dy))
             print(f"\nDeslocamento atual (cm - alvo): dx = {dx:+.3f}, dy = {dy:+.3f} px")
 
             if abs(dx) <= lim_px and abs(dy) <= lim_px:
                 print("Dentro da tolerancia em pixels. Encerrando correcoes.")
                 break
 
+            if toca_borda:
+                print("Foco medido tocando a borda; nao vou aplicar nova correcao automatica.")
+                break
+
+            matrix_name, A_inv = _select_A_inv(matrices, radius_px)
             vec_px = np.array([-dx, -dy])
             correcao = A_inv @ vec_px
-            dAz_deg = float(correcao[0])
-            dAlt_deg = float(correcao[1])
+            raw_dAz_deg = float(correcao[0])
+            raw_dAlt_deg = float(correcao[1])
+            dAz_deg, dAlt_deg, applied_scale = _limit_correction(raw_dAz_deg, raw_dAlt_deg)
 
             print("--- Correcao de apontamento usando A^{-1} ---")
+            print(
+                f"Iteracao {iter_idx}/{MAX_CENTERING_ITERS} | matriz={matrix_name} | "
+                f"raio={radius_px:.2f}px | ganho_efetivo={applied_scale:.3f}"
+            )
+            print(
+                f"Movimento calculado: dAz = {raw_dAz_deg:+.6f} deg, "
+                f"dAlt = {raw_dAlt_deg:+.6f} deg"
+            )
             print(f"Movimento alvo: dAz = {dAz_deg:+.6f} deg, dAlt = {dAlt_deg:+.6f} deg")
 
             move_axes_pid_2d(usar_mount, dAz_deg, dAlt_deg)
@@ -591,12 +653,39 @@ def main() -> None:
             cm = centro_massa(frame)
             if cm is None:
                 print("Imagem sem sinal ou foco travado nao encontrado apos correcao; interrompendo.")
+                if ROLLBACK_ON_WORSE:
+                    print("Revertendo o ultimo movimento para evitar perder o spot.")
+                    move_axes_pid_2d(usar_mount, -dAz_deg, -dAlt_deg)
+                    frame = capture_frame(EXPOSURE_SECONDS, light=True)
+                    cm = centro_massa(frame)
+                    if cm is not None:
+                        x_cm, y_cm, intensidade, toca_borda = cm
                 output_path = FOCO_DIR / "foco_temp_ultimo_frame.png"
                 cv2.imwrite(str(output_path), frame)
                 print(f"Ultimo frame salvo em: {output_path}")
                 break
 
             x_cm, y_cm, intensidade, toca_borda = cm
+            new_radius_px = float(np.hypot(x_cm - cx, y_cm - cy))
+            worse_limit = max(
+                radius_px + WORSE_ABORT_MARGIN_PX,
+                radius_px * WORSE_ABORT_FACTOR,
+            )
+            if new_radius_px > worse_limit:
+                print(
+                    "Correcao piorou muito o erro "
+                    f"({radius_px:.2f}px -> {new_radius_px:.2f}px)."
+                )
+                if ROLLBACK_ON_WORSE:
+                    print("Revertendo o ultimo movimento e interrompendo a centralizacao.")
+                    move_axes_pid_2d(usar_mount, -dAz_deg, -dAlt_deg)
+                    frame = capture_frame(EXPOSURE_SECONDS, light=True)
+                    cm = centro_massa(frame)
+                    if cm is not None:
+                        x_cm, y_cm, intensidade, toca_borda = cm
+                break
+        else:
+            print(f"Limite de {MAX_CENTERING_ITERS} iteracoes atingido.")
 
         print(f"\nCM final: ({x_cm:.2f}, {y_cm:.2f})")
         dx_final = x_cm - cx

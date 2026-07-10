@@ -94,9 +94,13 @@ def escolher_posicao_inicial_ou_centro(
     y_inicial: float,
     prompt: str = "Referencia de alinhamento",
     salvar_novo_alvo: bool = True,
+    default_choice: str = "1",
 ) -> AlvoAlinhamento:
     salvo = carregar_alvo_salvo()
     cx, cy = centro_frame(frame)
+    default_choice = str(default_choice).strip() or "1"
+    if default_choice not in {"1", "2", "3"}:
+        default_choice = "1"
 
     print(f"\n{prompt}:")
     if salvo is not None:
@@ -106,7 +110,7 @@ def escolher_posicao_inicial_ou_centro(
     print(f"  2 = definir novo alvo pela posicao inicial ({x_inicial:.2f}, {y_inicial:.2f})")
     print(f"  3 = usar centro da camera ({cx:.2f}, {cy:.2f})")
 
-    choice = input("Escolha [1]: ").strip() or "1"
+    choice = input(f"Escolha [{default_choice}]: ").strip() or default_choice
     if choice == "1" and salvo is not None:
         return salvo
     if choice == "1":
